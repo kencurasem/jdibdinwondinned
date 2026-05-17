@@ -1256,3 +1256,265 @@ echo "  3. Refresh your panel to see changes"
 echo ""
 echo -e "${GREEN}Your panel is now secured with KahfiModTzy Protection!${NC}"
 echo "=============================================================="
+# ═══════════════════════════════════════════════════════════════
+#  KahfiModTzy :: Protect Admin Server Pages
+# ═══════════════════════════════════════════════════════════════
+
+print_status "Installing Server Admin Page Protection..."
+
+create_protected_file "$PANEL_PATH/app/Http/Controllers/Admin/ServersController.php" '<?php
+
+namespace Pterodactyl\Http\Controllers\Admin;
+
+use Illuminate\View\View;
+use Illuminate\Http\Request;
+use Illuminate\Http\Response;
+use Pterodactyl\Models\Node;
+use Pterodactyl\Models\User;
+use Pterodactyl\Models\Nest;
+use Pterodactyl\Models\Server;
+use Illuminate\Http\RedirectResponse;
+use Prologue\Alerts\AlertsMessageBag;
+use Pterodactyl\Exceptions\DisplayException;
+use Pterodactyl\Http\Controllers\Controller;
+use Illuminate\Support\Facades\Auth;
+use Pterodactyl\Services\Servers\BuildModificationService;
+use Pterodactyl\Services\Servers\ServerDeletionService;
+use Pterodactyl\Services\Servers\DetailsModificationService;
+use Pterodactyl\Services\Servers\StartupModificationService;
+use Pterodactyl\Services\Servers\ReinstallServerService;
+use Pterodactyl\Services\Servers\SuspendServerService;
+use Pterodactyl\Services\Servers\UnsuspendServerService;
+use Pterodactyl\Repositories\Eloquent\DatabaseHostRepository;
+use Pterodactyl\Contracts\Repository\NestRepositoryInterface;
+use Pterodactyl\Contracts\Repository\NodeRepositoryInterface;
+use Pterodactyl\Contracts\Repository\ServerRepositoryInterface;
+use Pterodactyl\Contracts\Repository\DatabaseRepositoryInterface;
+use Pterodactyl\Contracts\Repository\AllocationRepositoryInterface;
+use Pterodactyl\Http\Requests\Admin\ServerFormRequest;
+use Pterodactyl\Http\Requests\Admin\Servers\Databases\AttachDatabaseRequest;
+use Pterodactyl\Services\Servers\ServerCreationService;
+use Pterodactyl\Services\Databases\DatabaseManagementService;
+use Pterodactyl\Services\Databases\DatabasePasswordService;
+use Spatie\QueryBuilder\QueryBuilder;
+use Illuminate\View\Factory as ViewFactory;
+
+class ServersController extends Controller
+{
+    public function __construct(
+        protected AlertsMessageBag $alert,
+        protected AllocationRepositoryInterface $allocationRepository,
+        protected BuildModificationService $buildModificationService,
+        protected DatabaseManagementService $databaseManagementService,
+        protected DatabasePasswordService $databasePasswordService,
+        protected DatabaseRepositoryInterface $databaseRepository,
+        protected DatabaseHostRepository $databaseHostRepository,
+        protected ServerDeletionService $deletionService,
+        protected DetailsModificationService $detailsModificationService,
+        protected ReinstallServerService $reinstallService,
+        protected ServerRepositoryInterface $repository,
+        protected StartupModificationService $startupModificationService,
+        protected SuspendServerService $suspendService,
+        protected NestRepositoryInterface $nestRepository,
+        protected NodeRepositoryInterface $nodeRepository,
+        protected UnsuspendServerService $unsuspendService,
+        protected ServerCreationService $creationService,
+        protected ViewFactory $view,
+    ) {}
+
+    // ── Helper cek akses ─────────────────────────────────────
+    private function checkAdmin(string $action = "access"): void
+    {
+        $user = Auth::user();
+        if (!$user || $user->id !== 1) {
+            throw new DisplayException("✖ KahfiModTzy Protection :: Only Root Admin can $action servers");
+        }
+    }
+
+    public function index(Request $request): View
+    {
+        $servers = QueryBuilder::for(
+            Server::query()->with(["user", "node", "allocation", "nest", "egg"])
+        )
+            ->allowedFilters(["uuid", "name", "image"])
+            ->allowedSorts(["id", "uuid"])
+            ->paginate(25);
+
+        return $this->view->make("admin.servers.index", ["servers" => $servers]);
+    }
+
+    public function create(): View
+    {
+        $this->checkAdmin("create");
+
+        $nodes = Node::all();
+        if (count($nodes) < 1) {
+            $this->alert->warning(trans("admin/server.alerts.node_required"))->flash();
+            return redirect()->route("admin.nodes");
+        }
+
+        return $this->view->make("admin.servers.new", [
+            "nests" => $this->nestRepository->getWithEggs(),
+            "nodes" => $this->nodeRepository->all(),
+        ]);
+    }
+
+    public function store(ServerFormRequest $request): RedirectResponse
+    {
+        $this->checkAdmin("create");
+        $server = $this->creationService->handle($request->validated());
+        return redirect()->route("admin.servers.view", $server->id);
+    }
+
+    public function view(Request $request, int $server): View
+    {
+        return $this->view->make("admin.servers.view.index", [
+            "server" => Server::with(["allocations.node", "user", "nest", "egg"])->findOrFail($server),
+        ]);
+    }
+
+    public function viewDetails(Request $request, Server $server): View
+    {
+        $this->checkAdmin("view details of");
+        return $this->view->make("admin.servers.view.details", ["server" => $server]);
+    }
+
+    public function viewBuild(Request $request, Server $server): View
+    {
+        $this->checkAdmin("view build config of");
+        return $this->view->make("admin.servers.view.build", [
+            "server"      => $server,
+            "nodes"       => Node::all(),
+            "allocations" => $this->allocationRepository->getAllocationsForNode($server->node_id),
+        ]);
+    }
+
+    public function viewStartup(Request $request, Server $server): View
+    {
+        $this->checkAdmin("view startup of");
+        $parameters = $this->repository->getVariablesWithValues($server->id, true);
+        return $this->view->make("admin.servers.view.startup", [
+            "server"     => $server,
+            "nests"      => $this->nestRepository->getWithEggs(),
+            "variables"  => $parameters->variables,
+            "selectedEgg"=> $parameters->egg,
+        ]);
+    }
+
+    public function viewDatabase(Request $request, Server $server): View
+    {
+        $this->checkAdmin("view database of");
+        return $this->view->make("admin.servers.view.database", [
+            "hosts"  => $this->databaseHostRepository->all(),
+            "server" => $server,
+        ]);
+    }
+
+    public function viewManage(Request $request, Server $server): View
+    {
+        $this->checkAdmin("manage");
+        return $this->view->make("admin.servers.view.manage", ["server" => $server]);
+    }
+
+    public function viewDelete(Request $request, Server $server): View
+    {
+        $this->checkAdmin("delete");
+        return $this->view->make("admin.servers.view.delete", ["server" => $server]);
+    }
+
+    public function setDetails(Request $request, Server $server): RedirectResponse
+    {
+        $this->checkAdmin("modify details of");
+        $this->detailsModificationService->handle($server, $request->only(["owner_id", "external_id", "name", "description"]));
+        $this->alert->success(trans("admin/server.alerts.details_updated"))->flash();
+        return redirect()->route("admin.servers.view.details", $server->id);
+    }
+
+    public function setContainer(Request $request, Server $server): RedirectResponse
+    {
+        $this->checkAdmin("modify container of");
+        $this->detailsModificationService->handle($server, $request->only(["image"]));
+        $this->alert->success(trans("admin/server.alerts.docker_image_updated"))->flash();
+        return redirect()->route("admin.servers.view.details", $server->id);
+    }
+
+    public function updateBuild(Request $request, Server $server): RedirectResponse
+    {
+        $this->checkAdmin("modify build config of");
+        $this->buildModificationService->handle($server, $request->only(["allocation_id", "memory", "swap", "io", "cpu", "disk", "database_limit", "allocation_limit", "backup_limit"]));
+        $this->alert->success(trans("admin/server.alerts.build_updated"))->flash();
+        return redirect()->route("admin.servers.view.build", $server->id);
+    }
+
+    public function saveStartup(Request $request, Server $server): RedirectResponse
+    {
+        $this->checkAdmin("modify startup of");
+        $this->startupModificationService->setUserLevel(User::USER_LEVEL_ADMIN)->handle($server, $request->except(["_token"]));
+        $this->alert->success(trans("admin/server.alerts.startup_changed"))->flash();
+        return redirect()->route("admin.servers.view.startup", $server->id);
+    }
+
+    public function addDatabase(AttachDatabaseRequest $request, Server $server): RedirectResponse
+    {
+        $this->checkAdmin("add database to");
+        $this->databaseManagementService->create($server, ["database" => $request->input("database"), "remote" => $request->input("remote"), "database_host_id" => $request->input("database_host_id")]);
+        return redirect()->route("admin.servers.view.database", $server->id);
+    }
+
+    public function resetDatabasePassword(Request $request, Server $server): RedirectResponse
+    {
+        $this->checkAdmin("reset database password of");
+        $database = $server->databases->find($request->input("database"));
+        $this->databasePasswordService->handle($database);
+        return response("", 204);
+    }
+
+    public function deleteDatabase(Request $request, Server $server): RedirectResponse
+    {
+        $this->checkAdmin("delete database from");
+        $database = $server->databases->findOrFail($request->input("database"));
+        $this->databaseManagementService->delete($database);
+        return response("", 204);
+    }
+
+    public function manageSuspend(Request $request, Server $server): RedirectResponse
+    {
+        $this->checkAdmin("suspend/unsuspend");
+        if ($request->input("action") === "suspend") {
+            $this->suspendService->handle($server);
+            $this->alert->success(trans("admin/server.alerts.server_suspended"))->flash();
+        } else {
+            $this->unsuspendService->handle($server);
+            $this->alert->success(trans("admin/server.alerts.server_unsuspended"))->flash();
+        }
+        return redirect()->route("admin.servers.view.manage", $server->id);
+    }
+
+    public function manageReinstall(Request $request, Server $server): RedirectResponse
+    {
+        $this->checkAdmin("reinstall");
+        $this->reinstallService->handle($server);
+        $this->alert->success(trans("admin/server.alerts.server_reinstalled"))->flash();
+        return redirect()->route("admin.servers.view.manage", $server->id);
+    }
+
+    public function delete(Request $request, Server $server): RedirectResponse
+    {
+        $this->checkAdmin("delete");
+        $this->deletionService->withForce($request->filled("force_delete"))->handle($server);
+        return redirect()->route("admin.servers");
+    }
+}' "ServersController"
+
+print_success "Server Admin Page Protection installed!"
+
+# Update summary
+echo "  • Admin Server Page Protection" >> "$BACKUP_DIR/installation_${TIMESTAMP}.log"
+
+print_status "Clearing cache after server protection..."
+cd "$PANEL_PATH" && php artisan view:clear > /dev/null 2>&1
+cd "$PANEL_PATH" && php artisan config:clear > /dev/null 2>&1
+cd "$PANEL_PATH" && php artisan route:clear > /dev/null 2>&1
+cd "$PANEL_PATH" && php artisan cache:clear > /dev/null 2>&1
+
+print_success "Server protection complete!"
