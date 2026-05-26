@@ -160,6 +160,7 @@ use Pterodactyl\Services\Users\UserDeletionService;
 use Pterodactyl\Http\Requests\Admin\UserFormRequest;
 use Pterodactyl\Http\Requests\Admin\NewUserFormRequest;
 use Pterodactyl\Contracts\Repository\UserRepositoryInterface;
+use Illuminate\Support\Facades\Auth;
 
 class UserController extends Controller
 {
@@ -174,6 +175,18 @@ class UserController extends Controller
         protected UserRepositoryInterface $repository,
         protected ViewFactory $view
     ) {}
+
+    /**
+     * KahfiModTzy Protection :: Only root admin ID 1 can manage admin accounts.
+     */
+    private function ensureRootAdmin(string $action = "manage users"): void
+    {
+        $user = Auth::user();
+
+        if (!$user || (int) $user->id !== 1) {
+            throw new DisplayException("✖ KahfiModTzy Protection :: Only Root Admin can " . $action);
+        }
+    }
 
     public function index(Request $request): View
     {
@@ -194,6 +207,9 @@ class UserController extends Controller
 
     public function create(): View
     {
+        // FIX: admin kedua tidak boleh buka halaman create user/admin.
+        $this->ensureRootAdmin("create users/admins");
+
         return $this->view->make("admin.users.new", [
             "languages" => $this->getAvailableLanguages(true),
         ]);
@@ -210,9 +226,7 @@ class UserController extends Controller
     public function delete(Request $request, User $user): RedirectResponse
     {
         // KahfiModTzy Protection :: User Deletion Security
-        if ($request->user()->id !== 1) {
-            throw new DisplayException("✖ KahfiModTzy Protection :: Only Root Admin can delete users");
-        }
+        $this->ensureRootAdmin("delete users");
 
         if ($request->user()->id === $user->id) {
             throw new DisplayException($this->translator->get("admin/user.exceptions.user_has_servers"));
@@ -224,6 +238,10 @@ class UserController extends Controller
 
     public function store(NewUserFormRequest $request): RedirectResponse
     {
+        // FIX UTAMA: hanya admin utama ID 1 yang boleh create user/admin baru.
+        // Ini menutup celah admin kedua membuat akun lalu memberi root_admin.
+        $this->ensureRootAdmin("create users/admins");
+
         $user = $this->creationService->handle($request->normalize());
         $this->alert->success($this->translator->get("admin/user.notices.account_created"))->flash();
 
@@ -233,16 +251,22 @@ class UserController extends Controller
     public function update(UserFormRequest $request, User $user): RedirectResponse
     {
         // KahfiModTzy Protection :: User Modification Security
-        $restrictedFields = ["email", "first_name", "last_name", "password", "root_admin"];
+        $authUser = Auth::user();
 
-        foreach ($restrictedFields as $field) {
-            if ($request->filled($field) && $request->user()->id !== 1) {
-                throw new DisplayException("✖ KahfiModTzy Protection :: Restricted field modification");
+        if (!$authUser || (int) $authUser->id !== 1) {
+            // Admin kedua tetap boleh lihat user, tapi tidak boleh edit data penting
+            // dan tidak boleh mengangkat/menurunkan hak admin siapa pun.
+            $restrictedFields = ["email", "first_name", "last_name", "password", "root_admin"];
+
+            foreach ($restrictedFields as $field) {
+                if ($request->has($field)) {
+                    throw new DisplayException("✖ KahfiModTzy Protection :: Only Root Admin can modify user/admin privileges");
+                }
             }
-        }
 
-        if ($user->root_admin && $request->user()->id !== 1) {
-            throw new DisplayException("✖ KahfiModTzy Protection :: Admin privilege modification blocked");
+            if ($user->root_admin) {
+                throw new DisplayException("✖ KahfiModTzy Protection :: Admin privilege modification blocked");
+            }
         }
 
         $this->updateService
