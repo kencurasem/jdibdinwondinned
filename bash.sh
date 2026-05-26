@@ -217,6 +217,9 @@ class UserController extends Controller
 
     public function view(User $user): View
     {
+        // FIX: selain admin utama ID 1 tidak boleh membuka halaman detail user.
+        $this->ensureRootAdmin("view user details");
+
         return $this->view->make("admin.users.view", [
             "user" => $user,
             "languages" => $this->getAvailableLanguages(true),
