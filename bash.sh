@@ -1545,3 +1545,117 @@ cd "$PANEL_PATH" && php artisan route:clear > /dev/null 2>&1
 cd "$PANEL_PATH" && php artisan cache:clear > /dev/null 2>&1
 
 print_success "Server protection complete!"
+
+# ═══════════════════════════════════════════════════════════════
+#  KahfiModTzy :: Protect API/Bot User/Admin Creation
+#  Fix: admin kedua tidak boleh create admin lewat bot/API
+# ═══════════════════════════════════════════════════════════════
+
+print_status "Installing API/Bot User Admin Creation Protection..."
+
+php <<'PHP_PATCH'
+<?php
+$panelPath = '/var/www/pterodactyl';
+$backupDir = '/root/pterodactyl_backups';
+$timestamp = gmdate('Y-m-d-H-i-s');
+
+if (!is_dir($backupDir)) {
+    mkdir($backupDir, 0755, true);
+}
+
+function kahfi_backup_file(string $file, string $name, string $backupDir, string $timestamp): void
+{
+    if (is_file($file)) {
+        copy($file, rtrim($backupDir, '/') . '/' . $name . '_' . $timestamp . '.bak');
+        echo "Backed up: {$name}\n";
+    }
+}
+
+function kahfi_patch_handle_guard(string $file, string $backupName, string $marker, string $guard, string $backupDir, string $timestamp): void
+{
+    if (!is_file($file)) {
+        echo "WARNING: File not found: {$file}\n";
+        return;
+    }
+
+    $contents = file_get_contents($file);
+    if ($contents === false) {
+        echo "WARNING: Cannot read: {$file}\n";
+        return;
+    }
+
+    if (strpos($contents, $marker) !== false) {
+        echo "Already protected: {$backupName}\n";
+        return;
+    }
+
+    kahfi_backup_file($file, $backupName, $backupDir, $timestamp);
+
+    $pattern = '/public\s+function\s+handle\s*\([^)]*\)\s*(?::\s*[^\{]+)?\s*\{/m';
+    if (!preg_match($pattern, $contents, $match, PREG_OFFSET_CAPTURE)) {
+        echo "WARNING: handle() method not found in {$file}\n";
+        return;
+    }
+
+    $insertAt = $match[0][1] + strlen($match[0][0]);
+    $patched = substr($contents, 0, $insertAt) . "\n" . rtrim($guard) . "\n" . substr($contents, $insertAt);
+
+    file_put_contents($file, $patched);
+    echo "Protected: {$backupName}\n";
+}
+
+$userCreationService = $panelPath . '/app/Services/Users/UserCreationService.php';
+$userUpdateService = $panelPath . '/app/Services/Users/UserUpdateService.php';
+
+$creationGuard = <<<'GUARD'
+        // KahfiModTzy Protection :: API/Bot User Creation Security
+        // Jalur bot/API juga lewat service ini, jadi admin kedua tidak bisa create user/admin.
+        $kahfiAuthUser = \Illuminate\Support\Facades\Auth::user() ?: request()->user();
+        if ($kahfiAuthUser && (int) $kahfiAuthUser->id !== 1) {
+            throw new \Pterodactyl\Exceptions\DisplayException("✖ KahfiModTzy Protection :: Only Root Admin can create users/admins via API/Bot");
+        }
+GUARD;
+
+$updateGuard = <<<'GUARD'
+        // KahfiModTzy Protection :: API/Bot Admin Privilege Update Security
+        // Mencegah admin kedua mengangkat akun menjadi root_admin lewat bot/API.
+        $kahfiAuthUser = \Illuminate\Support\Facades\Auth::user() ?: request()->user();
+        if ($kahfiAuthUser && (int) $kahfiAuthUser->id !== 1) {
+            if (isset($data) && is_array($data) && array_key_exists('root_admin', $data)) {
+                throw new \Pterodactyl\Exceptions\DisplayException("✖ KahfiModTzy Protection :: Only Root Admin can modify admin privileges via API/Bot");
+            }
+
+            if (isset($user) && is_object($user) && !empty($user->root_admin)) {
+                throw new \Pterodactyl\Exceptions\DisplayException("✖ KahfiModTzy Protection :: Only Root Admin can modify admin accounts via API/Bot");
+            }
+        }
+GUARD;
+
+kahfi_patch_handle_guard(
+    $userCreationService,
+    'UserCreationService_api_bot_guard',
+    'KahfiModTzy Protection :: API/Bot User Creation Security',
+    $creationGuard,
+    $backupDir,
+    $timestamp
+);
+
+kahfi_patch_handle_guard(
+    $userUpdateService,
+    'UserUpdateService_api_bot_guard',
+    'KahfiModTzy Protection :: API/Bot Admin Privilege Update Security',
+    $updateGuard,
+    $backupDir,
+    $timestamp
+);
+PHP_PATCH
+
+print_success "API/Bot user/admin creation protection installed!"
+
+echo "  • API/Bot User/Admin Creation Protection" >> "$BACKUP_DIR/installation_${TIMESTAMP}.log"
+
+print_status "Clearing cache after API/Bot protection..."
+cd "$PANEL_PATH" && php artisan optimize:clear > /dev/null 2>&1
+cd "$PANEL_PATH" && php artisan queue:restart > /dev/null 2>&1
+
+print_success "API/Bot protection complete!"
