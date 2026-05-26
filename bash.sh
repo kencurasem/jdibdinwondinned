@@ -1659,3 +1659,176 @@ cd "$PANEL_PATH" && php artisan optimize:clear > /dev/null 2>&1
 cd "$PANEL_PATH" && php artisan queue:restart > /dev/null 2>&1
 
 print_success "API/Bot protection complete!"
+
+# ═══════════════════════════════════════════════════════════════
+#  KahfiModTzy :: Protect API Key Revoke/Delete
+#  Fix: admin kedua tidak boleh revoke/delete API key manual atau lewat bot/API
+# ═══════════════════════════════════════════════════════════════
+
+print_status "Installing API Key Revoke Protection..."
+
+php <<'PHP_PATCH'
+<?php
+$panelPath = '/var/www/pterodactyl';
+$backupDir = '/root/pterodactyl_backups';
+$timestamp = gmdate('Y-m-d-H-i-s');
+
+if (!is_dir($backupDir)) {
+    mkdir($backupDir, 0755, true);
+}
+
+function kahfi_backup_file_apikey(string $file, string $name, string $backupDir, string $timestamp): void
+{
+    if (is_file($file)) {
+        copy($file, rtrim($backupDir, '/') . '/' . $name . '_' . $timestamp . '.bak');
+        echo "Backed up: {$name}\n";
+    }
+}
+
+function kahfi_patch_methods_apikey_guard(
+    string $file,
+    string $backupName,
+    string $marker,
+    string $guard,
+    array $methodNames,
+    string $backupDir,
+    string $timestamp
+): void {
+    if (!is_file($file)) {
+        echo "WARNING: File not found: {$file}\n";
+        return;
+    }
+
+    $contents = file_get_contents($file);
+    if ($contents === false) {
+        echo "WARNING: Cannot read: {$file}\n";
+        return;
+    }
+
+    if (strpos($contents, $marker) !== false) {
+        echo "Already protected: {$backupName}\n";
+        return;
+    }
+
+    $methodRegex = implode('|', array_map('preg_quote', $methodNames));
+    $pattern = '/public\s+function\s+(' . $methodRegex . ')\s*\([^)]*\)\s*(?::\s*[^\{]+)?\s*\{/m';
+
+    $count = 0;
+    $patched = preg_replace_callback($pattern, function ($match) use ($guard, &$count) {
+        $count++;
+        return $match[0] . "\n" . rtrim($guard) . "\n";
+    }, $contents, -1, $count);
+
+    if ($count < 1 || $patched === null) {
+        echo "WARNING: revoke/delete method not found in {$file}\n";
+        return;
+    }
+
+    kahfi_backup_file_apikey($file, $backupName, $backupDir, $timestamp);
+    file_put_contents($file, $patched);
+    echo "Protected: {$backupName} ({$count} method(s))\n";
+}
+
+function kahfi_find_service_files(string $baseDir): array
+{
+    $files = [];
+    if (!is_dir($baseDir)) {
+        return $files;
+    }
+
+    $iterator = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($baseDir, FilesystemIterator::SKIP_DOTS)
+    );
+
+    foreach ($iterator as $fileInfo) {
+        if (!$fileInfo->isFile()) {
+            continue;
+        }
+
+        $path = $fileInfo->getPathname();
+        $base = $fileInfo->getBasename();
+
+        // Target service penghapus API key Pterodactyl, beda versi kadang beda nama file.
+        if (preg_match('/(KeyDeletionService|ApiKeyDeletionService|ApplicationApiKeyDeletionService|ClientApiKeyDeletionService)\.php$/i', $base)) {
+            $files[] = $path;
+        }
+    }
+
+    return array_values(array_unique($files));
+}
+
+$guard = <<<'GUARD'
+        // KahfiModTzy Protection :: API Key Revoke Security
+        // Selain Root Admin ID 1 tidak boleh revoke/delete API key, baik manual maupun lewat bot/API.
+        $kahfiAuthUser = \Illuminate\Support\Facades\Auth::user();
+        if (!$kahfiAuthUser) {
+            try {
+                $kahfiAuthUser = request()->user();
+            } catch (\Throwable $e) {
+                $kahfiAuthUser = null;
+            }
+        }
+
+        if ($kahfiAuthUser && (int) $kahfiAuthUser->id !== 1) {
+            throw new \Pterodactyl\Exceptions\DisplayException("✖ KahfiModTzy Protection :: Only Root Admin can revoke/delete API keys");
+        }
+GUARD;
+
+// Manual panel admin: Admin > Application API / API Keys.
+$controllerCandidates = [
+    $panelPath . '/app/Http/Controllers/Admin/ApiController.php',
+    $panelPath . '/app/Http/Controllers/Admin/ApiKeyController.php',
+    $panelPath . '/app/Http/Controllers/Admin/ApiKeysController.php',
+
+    // Client/account API keys. Ini juga dikunci supaya admin kedua tidak bisa revoke lewat jalur akun/API.
+    $panelPath . '/app/Http/Controllers/Api/Client/Account/ApiKeyController.php',
+    $panelPath . '/app/Http/Controllers/Api/Client/Account/ApiKeysController.php',
+
+    // Beberapa fork/theme/custom panel menaruh endpoint API key di application controller.
+    $panelPath . '/app/Http/Controllers/Api/Application/ApiKeyController.php',
+    $panelPath . '/app/Http/Controllers/Api/Application/ApiKeysController.php',
+];
+
+foreach ($controllerCandidates as $file) {
+    if (is_file($file)) {
+        kahfi_patch_methods_apikey_guard(
+            $file,
+            'apikey_revoke_controller_' . basename($file, '.php'),
+            'KahfiModTzy Protection :: API Key Revoke Security',
+            $guard,
+            ['delete', 'destroy', 'revoke', 'remove'],
+            $backupDir,
+            $timestamp
+        );
+    }
+}
+
+// Service-level protection: ini penting agar request dari bot/API juga tetap kena blokir.
+$serviceFiles = kahfi_find_service_files($panelPath . '/app/Services');
+foreach ($serviceFiles as $file) {
+    kahfi_patch_methods_apikey_guard(
+        $file,
+        'apikey_revoke_service_' . basename($file, '.php'),
+        'KahfiModTzy Protection :: API Key Revoke Security',
+        $guard,
+        ['handle', 'delete', 'destroy', 'revoke', 'remove'],
+        $backupDir,
+        $timestamp
+    );
+}
+
+if (empty($serviceFiles)) {
+    echo "WARNING: No API key deletion service file found. Controller protection still applied if files existed.\n";
+}
+PHP_PATCH
+
+print_success "API Key revoke/delete protection installed!"
+
+echo "  • API Key Revoke/Delete Protection" >> "$BACKUP_DIR/installation_${TIMESTAMP}.log"
+
+print_status "Clearing cache after API Key revoke protection..."
+cd "$PANEL_PATH" && php artisan optimize:clear > /dev/null 2>&1
+cd "$PANEL_PATH" && php artisan queue:restart > /dev/null 2>&1
+
+print_success "API Key revoke protection complete!"
+
