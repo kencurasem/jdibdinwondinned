@@ -207,9 +207,8 @@ class UserController extends Controller
 
     public function create(): View
     {
-        // FIX: admin kedua tidak boleh buka halaman create user/admin.
-        $this->ensureRootAdmin("create users/admins");
-
+        // FIX: admin kedua boleh membuka halaman create user.
+        // Yang diblokir hanya create admin/root_admin, bukan create user biasa.
         return $this->view->make("admin.users.new", [
             "languages" => $this->getAvailableLanguages(true),
         ]);
@@ -241,14 +240,34 @@ class UserController extends Controller
 
     public function store(NewUserFormRequest $request): RedirectResponse
     {
-        // FIX UTAMA: hanya admin utama ID 1 yang boleh create user/admin baru.
-        // Ini menutup celah admin kedua membuat akun lalu memberi root_admin.
-        $this->ensureRootAdmin("create users/admins");
+        // FIX UTAMA: admin kedua boleh create user biasa.
+        // Yang dilarang hanya membuat akun baru sebagai admin/root_admin.
+        $data = $request->normalize();
+        $authUser = Auth::user();
 
-        $user = $this->creationService->handle($request->normalize());
+        if (!$authUser) {
+            throw new DisplayException("✖ KahfiModTzy Protection :: Unauthorized user creation attempt");
+        }
+
+        if ((int) $authUser->id !== 1) {
+            $rootAdminRaw = $data["root_admin"] ?? $request->input("root_admin", false);
+            $rootAdminEnabled = filter_var($rootAdminRaw, FILTER_VALIDATE_BOOLEAN);
+
+            if ($rootAdminEnabled) {
+                throw new DisplayException("✖ KahfiModTzy Protection :: Only Root Admin can create admin accounts");
+            }
+
+            // Paksa akun yang dibuat admin kedua menjadi user biasa.
+            $data["root_admin"] = false;
+        }
+
+        $user = $this->creationService->handle($data);
         $this->alert->success($this->translator->get("admin/user.notices.account_created"))->flash();
 
-        return redirect()->route("admin.users.view", $user->id);
+        // Admin kedua tidak boleh buka detail user, jadi arahkan balik ke list user.
+        return ((int) $authUser->id === 1)
+            ? redirect()->route("admin.users.view", $user->id)
+            : redirect()->route("admin.users");
     }
 
     public function update(UserFormRequest $request, User $user): RedirectResponse
@@ -1604,15 +1623,51 @@ function kahfi_patch_handle_guard(string $file, string $backupName, string $mark
     echo "Protected: {$backupName}\n";
 }
 
+function kahfi_remove_legacy_user_creation_guard(string $file, string $backupDir, string $timestamp): void
+{
+    if (!is_file($file)) {
+        return;
+    }
+
+    $contents = file_get_contents($file);
+    if ($contents === false) {
+        return;
+    }
+
+    // Hapus guard lama yang memblokir semua create user dari admin kedua.
+    $legacyPattern = '/\n\s*\/\/ KahfiModTzy Protection :: API\/Bot User Creation Security\s*\n\s*\/\/ Jalur bot\/API juga lewat service ini, jadi admin kedua tidak bisa create user\/admin\.\s*\n\s*\$kahfiAuthUser = \\\\Illuminate\\\\Support\\\\Facades\\\\Auth::user\(\) \?: request\(\)->user\(\);\s*\n\s*if \(\$kahfiAuthUser && \(int\) \$kahfiAuthUser->id !== 1\) \{\s*\n\s*throw new \\\\Pterodactyl\\\\Exceptions\\\\DisplayException\("✖ KahfiModTzy Protection :: Only Root Admin can create users\/admins via API\/Bot"\);\s*\n\s*\}\s*/m';
+
+    $patched = preg_replace($legacyPattern, "\n", $contents, 1, $count);
+
+    if ($patched !== null && $count > 0) {
+        kahfi_backup_file($file, 'UserCreationService_legacy_guard_removed', $backupDir, $timestamp);
+        file_put_contents($file, $patched);
+        echo "Removed legacy blocking guard: UserCreationService\n";
+    }
+}
+
 $userCreationService = $panelPath . '/app/Services/Users/UserCreationService.php';
 $userUpdateService = $panelPath . '/app/Services/Users/UserUpdateService.php';
 
+kahfi_remove_legacy_user_creation_guard($userCreationService, $backupDir, $timestamp);
+
 $creationGuard = <<<'GUARD'
         // KahfiModTzy Protection :: API/Bot User Creation Security
-        // Jalur bot/API juga lewat service ini, jadi admin kedua tidak bisa create user/admin.
+        // Admin kedua boleh create user biasa; yang diblokir hanya admin/root_admin.
         $kahfiAuthUser = \Illuminate\Support\Facades\Auth::user() ?: request()->user();
         if ($kahfiAuthUser && (int) $kahfiAuthUser->id !== 1) {
-            throw new \Pterodactyl\Exceptions\DisplayException("✖ KahfiModTzy Protection :: Only Root Admin can create users/admins via API/Bot");
+            $kahfiIncomingData = (isset($data) && is_array($data)) ? $data : [];
+            $kahfiRootAdminRaw = $kahfiIncomingData['root_admin'] ?? false;
+            $kahfiRootAdminEnabled = filter_var($kahfiRootAdminRaw, FILTER_VALIDATE_BOOLEAN);
+
+            if ($kahfiRootAdminEnabled) {
+                throw new \Pterodactyl\Exceptions\DisplayException("✖ KahfiModTzy Protection :: Only Root Admin can create admin/root_admin accounts via API/Bot");
+            }
+
+            // Paksa jalur bot/API dari admin kedua tetap membuat user biasa.
+            if (isset($data) && is_array($data)) {
+                $data['root_admin'] = false;
+            }
         }
 GUARD;
 
