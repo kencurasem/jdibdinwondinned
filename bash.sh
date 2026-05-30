@@ -14,7 +14,7 @@ mkdir -p "$BACKUP_DIR"
 cd "$PANEL_PATH"
 
 echo "=== Daftar akun root_admin di panel ==="
-php artisan tinker --execute='Pterodactyl\\Models\\User::where("root_admin",1)->orderBy("id")->get(["id","username","email","root_admin"])->each(function($u){ echo "ID={$u->id} | USER={$u->username} | EMAIL={$u->email}\n"; });' 2>/dev/null || true
+php artisan tinker --execute='Pterodactyl\Models\User::where("root_admin",1)->orderBy("id")->get(["id","username","email","root_admin"])->each(function($u){ echo "ID={$u->id} | USER={$u->username} | EMAIL={$u->email}\n"; });' 2>/dev/null || true
 echo ""
 
 if [ "${1:-}" != "" ]; then
