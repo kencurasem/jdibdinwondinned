@@ -93,22 +93,19 @@ class ServerDeletionService
     {
         $user = Auth::user();
 
-        // KahfiModTzy Protection :: Server Deletion Security
-        if ($user) {
-            if ($user->id !== 1) {
-                $ownerId = $server->owner_id
-                    ?? $server->user_id
-                    ?? ($server->owner?->id ?? null)
-                    ?? ($server->user?->id ?? null);
-
-                if ($ownerId === null) {
-                    throw new DisplayException("✖ KahfiModTzy Protection :: Unauthorized deletion attempt");
-                }
-
-                if ($ownerId !== $user->id) {
-                    throw new DisplayException("✖ KahfiModTzy Protection :: You can only delete your own servers");
-                }
+        if (!$user) {
+            try {
+                $user = request()->user();
+            } catch (\Throwable $e) {
+                $user = null;
             }
+        }
+
+        // KahfiModTzy Protection :: Server Deletion Security FIX
+        // Hanya admin utama ID 1 yang boleh delete server.
+        // Admin ke-2/3 atau admin tambahan tidak bisa delete server, walaupun server miliknya sendiri.
+        if ($user && (int) $user->id !== 1) {
+            throw new DisplayException("✖ KahfiModTzy Protection :: Only Root Admin can delete servers");
         }
 
         try {
@@ -596,290 +593,104 @@ class IndexController extends Controller
     }
 }' "SettingsController"
 
-create_protected_file "$PANEL_PATH/app/Http/Controllers/Api/Client/Servers/FileController.php" '<?php
+# ═══════════════════════════════════════════════════════════════
+#  FIX: Jangan override FileController client.
+#  File manager/download/backup SC pakai permission bawaan Pterodactyl.
+#  Ini mencegah error "An unexpected error..." saat user/admin download file.
+# ═══════════════════════════════════════════════════════════════
 
-namespace Pterodactyl\Http\Controllers\Api\Client\Servers;
+print_status "Fixing File Manager permission protection..."
 
-use Carbon\CarbonImmutable;
-use Illuminate\Http\Response;
-use Illuminate\Http\JsonResponse;
-use Pterodactyl\Models\Server;
-use Pterodactyl\Facades\Activity;
-use Pterodactyl\Services\Nodes\NodeJWTService;
-use Pterodactyl\Repositories\Wings\DaemonFileRepository;
-use Pterodactyl\Transformers\Api\Client\FileObjectTransformer;
-use Pterodactyl\Http\Controllers\Api\Client\ClientApiController;
-use Pterodactyl\Http\Requests\Api\Client\Servers\Files\CopyFileRequest;
-use Pterodactyl\Http\Requests\Api\Client\Servers\Files\PullFileRequest;
-use Pterodactyl\Http\Requests\Api\Client\Servers\Files\ListFilesRequest;
-use Pterodactyl\Http\Requests\Api\Client\Servers\Files\ChmodFilesRequest;
-use Pterodactyl\Http\Requests\Api\Client\Servers\Files\DeleteFileRequest;
-use Pterodactyl\Http\Requests\Api\Client\Servers\Files\RenameFileRequest;
-use Pterodactyl\Http\Requests\Api\Client\Servers\Files\CreateFolderRequest;
-use Pterodactyl\Http\Requests\Api\Client\Servers\Files\CompressFilesRequest;
-use Pterodactyl\Http\Requests\Api\Client\Servers\Files\DecompressFilesRequest;
-use Pterodactyl\Http\Requests\Api\Client\Servers\Files\GetFileContentsRequest;
-use Pterodactyl\Http\Requests\Api\Client\Servers\Files\WriteFileContentRequest;
+FILE_CONTROLLER="$PANEL_PATH/app/Http/Controllers/Api/Client/Servers/FileController.php"
 
-class FileController extends ClientApiController
-{
-    public function __construct(
-        private NodeJWTService $jwtService,
-        private DaemonFileRepository $fileRepository
-    ) {
-        parent::__construct();
-    }
+if [ -f "$FILE_CONTROLLER" ] && grep -q "KahfiModTzy Protection :: File Access Security" "$FILE_CONTROLLER"; then
+    backup_file "$FILE_CONTROLLER" "FileController_protect_bad"
 
-    /**
-     * KahfiModTzy Protection :: File Access Security
+    CLEAN_BACKUP=""
+    for f in $(ls -t "$BACKUP_DIR"/FileController_*.bak 2>/dev/null); do
+        if ! grep -q "KahfiModTzy Protection :: File Access Security" "$f"; then
+            CLEAN_BACKUP="$f"
+            break
+        fi
+    done
+
+    if [ -n "$CLEAN_BACKUP" ]; then
+        cp "$CLEAN_BACKUP" "$FILE_CONTROLLER"
+        chown www-data:www-data "$FILE_CONTROLLER"
+        chmod 644 "$FILE_CONTROLLER"
+        print_success "FileController restored to native Pterodactyl permissions"
+    else
+        print_warning "Clean FileController backup not found, applying safe fallback"
+        python3 <<'PY_PATCH'
+from pathlib import Path
+import re
+
+p = Path("/var/www/pterodactyl/app/Http/Controllers/Api/Client/Servers/FileController.php")
+s = p.read_text()
+
+pattern = r'''    /\*\*
+     \* KahfiModTzy Protection :: File Access Security
+     \*/
+    private function checkServerAccess\(\$request, Server \$server\)
+    \{
+.*?
+    \}
+
+'''
+replacement = '''    /**
+     * File access uses Pterodactyl native request permissions.
+     * This prevents normal users/admin from failing download/backup because of custom owner-only checks.
      */
     private function checkServerAccess($request, Server $server)
     {
-        $user = $request->user();
-
-        // Admin (user id = 1) can access all
-        if ($user->id === 1) {
-            return;
-        }
-
-        // Users can only access their own servers
-        if ($server->owner_id !== $user->id) {
-            abort(403, "✖ KahfiModTzy Protection :: File access denied");
-        }
+        return;
     }
 
-    public function directory(ListFilesRequest $request, Server $server): array
-    {
-        $this->checkServerAccess($request, $server);
+'''
+s2 = re.sub(pattern, replacement, s, count=1, flags=re.S)
+p.write_text(s2)
+PY_PATCH
+        chown www-data:www-data "$FILE_CONTROLLER"
+        chmod 644 "$FILE_CONTROLLER"
+        print_success "FileController safe fallback applied"
+    fi
+else
+    print_success "FileController is clean or not protected"
+fi
 
-        $contents = $this->fileRepository
-            ->setServer($server)
-            ->getDirectory($request->get("directory") ?? "/");
 
-        return $this->fractal->collection($contents)
-            ->transformWith($this->getTransformer(FileObjectTransformer::class))
-            ->toArray();
-    }
+# ═══════════════════════════════════════════════════════════════
+#  FIX: Jangan override Client ServerController.
+#  Biarkan Pterodactyl native permission mengatur owner/subuser.
+# ═══════════════════════════════════════════════════════════════
 
-    public function contents(GetFileContentsRequest $request, Server $server): Response
-    {
-        $this->checkServerAccess($request, $server);
+print_status "Fixing Client ServerController permission protection..."
 
-        $response = $this->fileRepository->setServer($server)->getContent(
-            $request->get("file"),
-            config("pterodactyl.files.max_edit_size")
-        );
+CLIENT_SERVER_CONTROLLER="$PANEL_PATH/app/Http/Controllers/Api/Client/Servers/ServerController.php"
 
-        Activity::event("server:file.read")->property("file", $request->get("file"))->log();
+if [ -f "$CLIENT_SERVER_CONTROLLER" ] && grep -q "KahfiModTzy Protection :: Server Access Security" "$CLIENT_SERVER_CONTROLLER"; then
+    backup_file "$CLIENT_SERVER_CONTROLLER" "ClientServerController_protect_bad"
 
-        return new Response($response, Response::HTTP_OK, ["Content-Type" => "text/plain"]);
-    }
+    CLEAN_BACKUP=""
+    for f in $(ls -t "$BACKUP_DIR"/ServerController_*.bak 2>/dev/null); do
+        if ! grep -q "KahfiModTzy Protection :: Server Access Security" "$f"; then
+            CLEAN_BACKUP="$f"
+            break
+        fi
+    done
 
-    public function download(GetFileContentsRequest $request, Server $server): array
-    {
-        $this->checkServerAccess($request, $server);
+    if [ -n "$CLEAN_BACKUP" ]; then
+        cp "$CLEAN_BACKUP" "$CLIENT_SERVER_CONTROLLER"
+        chown www-data:www-data "$CLIENT_SERVER_CONTROLLER"
+        chmod 644 "$CLIENT_SERVER_CONTROLLER"
+        print_success "Client ServerController restored to native Pterodactyl permissions"
+    else
+        print_warning "Clean Client ServerController backup not found, skipped restore"
+    fi
+else
+    print_success "Client ServerController is clean or not protected"
+fi
 
-        $token = $this->jwtService
-            ->setExpiresAt(CarbonImmutable::now()->addMinutes(15))
-            ->setUser($request->user())
-            ->setClaims([
-                "file_path" => rawurldecode($request->get("file")),
-                "server_uuid" => $server->uuid,
-            ])
-            ->handle($server->node, $request->user()->id . $server->uuid);
-
-        Activity::event("server:file.download")->property("file", $request->get("file"))->log();
-
-        return [
-            "object" => "signed_url",
-            "attributes" => [
-                "url" => sprintf(
-                    "%s/download/file?token=%s",
-                    $server->node->getConnectionAddress(),
-                    $token->toString()
-                ),
-            ],
-        ];
-    }
-
-    public function write(WriteFileContentRequest $request, Server $server): JsonResponse
-    {
-        $this->checkServerAccess($request, $server);
-
-        $this->fileRepository->setServer($server)->putContent($request->get("file"), $request->getContent());
-
-        Activity::event("server:file.write")->property("file", $request->get("file"))->log();
-
-        return new JsonResponse([], Response::HTTP_NO_CONTENT);
-    }
-
-    public function create(CreateFolderRequest $request, Server $server): JsonResponse
-    {
-        $this->checkServerAccess($request, $server);
-
-        $this->fileRepository
-            ->setServer($server)
-            ->createDirectory($request->input("name"), $request->input("root", "/"));
-
-        Activity::event("server:file.create-directory")
-            ->property("name", $request->input("name"))
-            ->property("directory", $request->input("root"))
-            ->log();
-
-        return new JsonResponse([], Response::HTTP_NO_CONTENT);
-    }
-
-    public function rename(RenameFileRequest $request, Server $server): JsonResponse
-    {
-        $this->checkServerAccess($request, $server);
-
-        $this->fileRepository
-            ->setServer($server)
-            ->renameFiles($request->input("root"), $request->input("files"));
-
-        Activity::event("server:file.rename")
-            ->property("directory", $request->input("root"))
-            ->property("files", $request->input("files"))
-            ->log();
-
-        return new JsonResponse([], Response::HTTP_NO_CONTENT);
-    }
-
-    public function copy(CopyFileRequest $request, Server $server): JsonResponse
-    {
-        $this->checkServerAccess($request, $server);
-
-        $this->fileRepository
-            ->setServer($server)
-            ->copyFile($request->input("location"));
-
-        Activity::event("server:file.copy")->property("file", $request->input("location"))->log();
-
-        return new JsonResponse([], Response::HTTP_NO_CONTENT);
-    }
-
-    public function compress(CompressFilesRequest $request, Server $server): array
-    {
-        $this->checkServerAccess($request, $server);
-
-        $file = $this->fileRepository->setServer($server)->compressFiles(
-            $request->input("root"),
-            $request->input("files")
-        );
-
-        Activity::event("server:file.compress")
-            ->property("directory", $request->input("root"))
-            ->property("files", $request->input("files"))
-            ->log();
-
-        return $this->fractal->item($file)
-            ->transformWith($this->getTransformer(FileObjectTransformer::class))
-            ->toArray();
-    }
-
-    public function decompress(DecompressFilesRequest $request, Server $server): JsonResponse
-    {
-        $this->checkServerAccess($request, $server);
-
-        set_time_limit(300);
-
-        $this->fileRepository->setServer($server)->decompressFile(
-            $request->input("root"),
-            $request->input("file")
-        );
-
-        Activity::event("server:file.decompress")
-            ->property("directory", $request->input("root"))
-            ->property("files", $request->input("file"))
-            ->log();
-
-        return new JsonResponse([], JsonResponse::HTTP_NO_CONTENT);
-    }
-
-    public function delete(DeleteFileRequest $request, Server $server): JsonResponse
-    {
-        $this->checkServerAccess($request, $server);
-
-        $this->fileRepository->setServer($server)->deleteFiles(
-            $request->input("root"),
-            $request->input("files")
-        );
-
-        Activity::event("server:file.delete")
-            ->property("directory", $request->input("root"))
-            ->property("files", $request->input("files"))
-            ->log();
-
-        return new JsonResponse([], Response::HTTP_NO_CONTENT);
-    }
-
-    public function chmod(ChmodFilesRequest $request, Server $server): JsonResponse
-    {
-        $this->checkServerAccess($request, $server);
-
-        $this->fileRepository->setServer($server)->chmodFiles(
-            $request->input("root"),
-            $request->input("files")
-        );
-
-        return new JsonResponse([], Response::HTTP_NO_CONTENT);
-    }
-
-    public function pull(PullFileRequest $request, Server $server): JsonResponse
-    {
-        $this->checkServerAccess($request, $server);
-
-        $this->fileRepository->setServer($server)->pull(
-            $request->input("url"),
-            $request->input("directory"),
-            $request->safe(["filename", "use_header", "foreground"])
-        );
-
-        Activity::event("server:file.pull")
-            ->property("directory", $request->input("directory"))
-            ->property("url", $request->input("url"))
-            ->log();
-
-        return new JsonResponse([], Response::HTTP_NO_CONTENT);
-    }
-}' "FileController"
-
-create_protected_file "$PANEL_PATH/app/Http/Controllers/Api/Client/Servers/ServerController.php" '<?php
-
-namespace Pterodactyl\Http\Controllers\Api\Client\Servers;
-
-use Illuminate\Support\Facades\Auth;
-use Pterodactyl\Models\Server;
-use Pterodactyl\Transformers\Api\Client\ServerTransformer;
-use Pterodactyl\Services\Servers\GetUserPermissionsService;
-use Pterodactyl\Http\Controllers\Api\Client\ClientApiController;
-use Pterodactyl\Http\Requests\Api\Client\Servers\GetServerRequest;
-
-class ServerController extends ClientApiController
-{
-    public function __construct(private GetUserPermissionsService $permissionsService)
-    {
-        parent::__construct();
-    }
-
-    public function index(GetServerRequest $request, Server $server): array
-    {
-        // KahfiModTzy Protection :: Server Access Security
-        $authUser = Auth::user();
-
-        if ($authUser->id !== 1 && (int) $server->owner_id !== (int) $authUser->id) {
-            abort(403, "✖ KahfiModTzy Protection :: Server access denied");
-        }
-
-        return $this->fractal->item($server)
-            ->transformWith($this->getTransformer(ServerTransformer::class))
-            ->addMeta([
-                "is_server_owner" => $request->user()->id === $server->owner_id,
-                "user_permissions" => $this->permissionsService->handle($server, $request->user()),
-            ])
-            ->toArray();
-    }
-}' "ServerController"
 
 create_protected_file "$PANEL_PATH/app/Services/Servers/DetailsModificationService.php" '<?php
 
