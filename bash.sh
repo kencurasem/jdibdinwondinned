@@ -1,122 +1,39 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/bash
+set -e
 
 PANEL_PATH="/var/www/pterodactyl"
-BACKUP_ROOT="/root/pterodactyl_backups"
-STAMP="$(date +%Y%m%d_%H%M%S)"
-BACKUP_DIR="$BACKUP_ROOT/delete_server_fix_v3_$STAMP"
+BACKUP_DIR="/root/pterodactyl_backups"
+TS="$(date -u +%Y-%m-%d-%H-%M-%S)"
 
 if [ ! -d "$PANEL_PATH" ]; then
   echo "ERROR: Folder panel tidak ketemu: $PANEL_PATH"
   exit 1
 fi
 
-cd "$PANEL_PATH"
 mkdir -p "$BACKUP_DIR"
 
-echo "=== DAFTAR ADMIN PANEL PTERODACTYL ==="
-php artisan tinker --execute='foreach (\Pterodactyl\Models\User::where("root_admin", 1)->orderBy("id")->get(["id","username","email"]) as $u) { echo "ID=".$u->id." | USER=".$u->username." | EMAIL=".$u->email.PHP_EOL; }' || true
+echo "== Fix protect delete server ID 1 =="
 
-echo ""
-if [ "${1:-}" != "" ]; then
-  MAIN_ADMIN_ID="$1"
-else
-  read -rp "Masukkan ID akun PANEL admin utama yang boleh delete server: " MAIN_ADMIN_ID
-fi
+cd "$PANEL_PATH"
 
-if ! [[ "$MAIN_ADMIN_ID" =~ ^[0-9]+$ ]]; then
-  echo "ERROR: ID harus angka ID akun PANEL, bukan ID Telegram. Contoh biasanya: 1"
-  exit 1
-fi
+# Backup file penting
+[ -f app/Services/Servers/ServerDeletionService.php ] && cp app/Services/Servers/ServerDeletionService.php "$BACKUP_DIR/ServerDeletionService_before_id1_delete_fix_$TS.bak"
+[ -f app/Http/Controllers/Admin/ServersController.php ] && cp app/Http/Controllers/Admin/ServersController.php "$BACKUP_DIR/ServersController_before_id1_delete_fix_$TS.bak"
+[ -f app/Http/Controllers/Api/Client/Servers/FileController.php ] && cp app/Http/Controllers/Api/Client/Servers/FileController.php "$BACKUP_DIR/FileController_before_id1_delete_fix_$TS.bak"
 
-echo "Admin utama yang boleh delete server: ID $MAIN_ADMIN_ID"
-echo "Backup disimpan ke: $BACKUP_DIR"
-
-backup_file() {
-  local f="$1"
-  if [ -f "$f" ]; then
-    mkdir -p "$BACKUP_DIR/$(dirname "$f")"
-    cp -a "$f" "$BACKUP_DIR/$f"
-    echo "Backup: $f"
-  fi
-}
-
-# 1) Fix FileController: jangan blokir download/backup file manager.
-FILE_CONTROLLER="app/Http/Controllers/Api/Client/Servers/FileController.php"
-if [ -f "$FILE_CONTROLLER" ]; then
-  backup_file "$FILE_CONTROLLER"
-  php <<'PHP_PATCH'
-<?php
-$file = 'app/Http/Controllers/Api/Client/Servers/FileController.php';
-$s = file_get_contents($file);
-if ($s === false) { fwrite(STDERR, "Gagal baca FileController\n"); exit(1); }
-
-$pattern = '/\/\*\*\s*\n\s*\* KahfiModTzy Protection :: File Access Security\s*\n\s*\*\/\s*\n\s*private function checkServerAccess\(\$request, Server \$server\)\s*\{.*?\n\s*\}\s*\n\s*public function directory/s';
-$replacement = <<<'REP'
-/**
-     * File access uses native Pterodactyl request permissions.
-     * This prevents backup/download errors for normal users.
-     */
-    private function checkServerAccess($request, Server $server)
-    {
-        return;
-    }
-
-    public function directory
-REP;
-
-$new = preg_replace($pattern, $replacement, $s, 1, $count);
-if ($new === null) { fwrite(STDERR, "Regex FileController error\n"); exit(1); }
-if ($count > 0) {
-    file_put_contents($file, $new);
-    echo "OK: FileController fixed, download/backup tidak diblokir protect.\n";
-} else {
-    echo "INFO: Block protect FileController tidak ketemu / sudah difix.\n";
-}
-PHP_PATCH
-  php -l "$FILE_CONTROLLER" >/dev/null
-fi
-
-# 2) Patch Admin ServersController: admin utama pakai ID yang benar, bukan selalu ID 1.
-SERVERS_CONTROLLER="app/Http/Controllers/Admin/ServersController.php"
-if [ -f "$SERVERS_CONTROLLER" ]; then
-  backup_file "$SERVERS_CONTROLLER"
-  MAIN_ADMIN_ID="$MAIN_ADMIN_ID" php <<'PHP_PATCH'
-<?php
-$file = 'app/Http/Controllers/Admin/ServersController.php';
-$main = (int) getenv('MAIN_ADMIN_ID');
-$s = file_get_contents($file);
-if ($s === false) { fwrite(STDERR, "Gagal baca ServersController\n"); exit(1); }
-
-// Ganti cek lama yang hardcode ID 1 menjadi ID admin utama yang diinput.
-$s = str_replace('if (!$user || $user->id !== 1) {', 'if (!$user || (int) $user->id !== '.$main.') {', $s);
-$s = str_replace('if (!$user || (int) $user->id !== 1) {', 'if (!$user || (int) $user->id !== '.$main.') {', $s);
-$s = str_replace('if (!$user || $user->id != 1) {', 'if (!$user || (int) $user->id !== '.$main.') {', $s);
-$s = str_replace('if (!$user || (int) $user->id != 1) {', 'if (!$user || (int) $user->id !== '.$main.') {', $s);
-
-file_put_contents($file, $s);
-echo "OK: ServersController admin delete/checkAdmin pakai ID {$main}.\n";
-PHP_PATCH
-  php -l "$SERVERS_CONTROLLER" >/dev/null
-fi
-
-# 3) Overwrite ServerDeletionService: hanya admin utama yang boleh delete server.
-SERVER_DELETION="app/Services/Servers/ServerDeletionService.php"
-if [ -f "$SERVER_DELETION" ]; then
-  backup_file "$SERVER_DELETION"
-fi
-
-cat > /tmp/ServerDeletionService.php <<'PHP_SERVICE'
+# 1) ServerDeletionService: hanya user ID 1 yang boleh delete server.
+#    Admin ID 1 dibuat force delete otomatis agar tidak 500 saat Wings/node bermasalah.
+cat > app/Services/Servers/ServerDeletionService.php <<'PHP'
 <?php
 
 namespace Pterodactyl\Services\Servers;
 
-use Illuminate\Support\Facades\Auth;
-use Pterodactyl\Exceptions\DisplayException;
 use Illuminate\Http\Response;
 use Pterodactyl\Models\Server;
+use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Database\ConnectionInterface;
+use Pterodactyl\Exceptions\DisplayException;
 use Pterodactyl\Repositories\Wings\DaemonServerRepository;
 use Pterodactyl\Services\Databases\DatabaseManagementService;
 use Pterodactyl\Exceptions\Http\Connection\DaemonConnectionException;
@@ -124,8 +41,6 @@ use Pterodactyl\Exceptions\Http\Connection\DaemonConnectionException;
 class ServerDeletionService
 {
     protected bool $force = false;
-
-    private int $mainAdminId = __MAIN_ADMIN_ID__;
 
     public function __construct(
         private ConnectionInterface $connection,
@@ -143,38 +58,42 @@ class ServerDeletionService
     {
         $user = Auth::user();
 
-        if (!$user) {
-            try {
-                $user = request()->user();
-            } catch (\Throwable $e) {
-                $user = null;
-            }
-        }
-
-        // Hanya admin utama panel yang boleh delete server.
-        // Admin ke-2/3/root_admin lain tetap tidak boleh delete.
-        if (!$user || (int) $user->id !== $this->mainAdminId) {
-            throw new DisplayException('KahfiModTzy Protection :: Hanya Admin Utama yang boleh delete server');
+        // KahfiModTzy Protection:
+        // Hanya ADMIN UTAMA panel ID 1 yang boleh delete server.
+        // Admin kedua/ketiga dan user biasa tidak boleh delete server.
+        if (!$user || (int) $user->id !== 1) {
+            throw new DisplayException('KahfiModTzy Protection :: Only admin utama ID 1 can delete servers');
         }
 
         try {
             $this->daemonServerRepository->setServer($server)->delete();
         } catch (DaemonConnectionException $exception) {
+            // Kalau Wings/node offline, admin ID 1 tetap bisa hapus data server dari panel.
+            // Ini mencegah 500 polos saat delete server.
+            Log::warning($exception);
+
             if (!$this->force && $exception->getStatusCode() !== Response::HTTP_NOT_FOUND) {
+                // Untuk jaga kompatibilitas service, exception tetap bisa dilempar kalau controller tidak force.
+                // Controller admin di bawah dipatch agar selalu force untuk ID 1.
                 throw $exception;
             }
-            Log::warning($exception);
         }
 
         $this->connection->transaction(function () use ($server) {
             foreach ($server->databases as $database) {
                 try {
                     $this->databaseManagementService->delete($database);
-                } catch (\Exception $exception) {
+                } catch (\Throwable $exception) {
                     if (!$this->force) {
                         throw $exception;
                     }
-                    $database->delete();
+
+                    try {
+                        $database->delete();
+                    } catch (\Throwable $ignored) {
+                        // Abaikan agar force delete admin utama tetap lanjut.
+                    }
+
                     Log::warning($exception);
                 }
             }
@@ -183,23 +102,200 @@ class ServerDeletionService
         });
     }
 }
-PHP_SERVICE
+PHP
 
-sed -i "s/__MAIN_ADMIN_ID__/$MAIN_ADMIN_ID/g" /tmp/ServerDeletionService.php
-php -l /tmp/ServerDeletionService.php >/dev/null
-cp /tmp/ServerDeletionService.php "$SERVER_DELETION"
-chown www-data:www-data "$SERVER_DELETION" 2>/dev/null || true
+# 2) Patch ServersController tanpa rewrite penuh:
+#    - checkAdmin wajib ID 1
+#    - method delete dibuat force delete otomatis
+php <<'PHP_PATCH'
+<?php
 
-echo "OK: ServerDeletionService fixed. Admin utama ID $MAIN_ADMIN_ID bisa delete, admin lain tidak."
+$file = '/var/www/pterodactyl/app/Http/Controllers/Admin/ServersController.php';
+$s = file_get_contents($file);
+if ($s === false) {
+    fwrite(STDERR, "ERROR: Tidak bisa baca ServersController.php\n");
+    exit(1);
+}
 
-# 4) Clear cache.
-chown -R www-data:www-data "$PANEL_PATH" 2>/dev/null || true
+function findMethodBlock(string $s, string $methodName): ?array {
+    if (!preg_match('/public\s+function\s+' . preg_quote($methodName, '/') . '\s*\([^)]*\)\s*(?::\s*[^{]+)?\s*\{/m', $s, $m, PREG_OFFSET_CAPTURE)) {
+        return null;
+    }
+    $start = $m[0][1];
+    $brace = $start + strlen($m[0][0]) - 1;
+    $depth = 0;
+    $len = strlen($s);
+    for ($i = $brace; $i < $len; $i++) {
+        $ch = $s[$i];
+        if ($ch === '{') $depth++;
+        if ($ch === '}') {
+            $depth--;
+            if ($depth === 0) return [$start, $i + 1];
+        }
+    }
+    return null;
+}
+
+function findPrivateMethodBlock(string $s, string $methodName): ?array {
+    if (!preg_match('/private\s+function\s+' . preg_quote($methodName, '/') . '\s*\([^)]*\)\s*(?::\s*[^{]+)?\s*\{/m', $s, $m, PREG_OFFSET_CAPTURE)) {
+        return null;
+    }
+    $start = $m[0][1];
+    $brace = $start + strlen($m[0][0]) - 1;
+    $depth = 0;
+    $len = strlen($s);
+    for ($i = $brace; $i < $len; $i++) {
+        $ch = $s[$i];
+        if ($ch === '{') $depth++;
+        if ($ch === '}') {
+            $depth--;
+            if ($depth === 0) return [$start, $i + 1];
+        }
+    }
+    return null;
+}
+
+$checkAdmin = <<<'PHP'
+    private function checkAdmin(string $action = "access"): void
+    {
+        $user = Auth::user();
+
+        // KahfiModTzy Protection:
+        // Admin utama panel pasti ID 1.
+        // Selain ID 1, termasuk admin ke-2/3, tidak boleh akses aksi server penting.
+        if (!$user || (int) $user->id !== 1) {
+            throw new DisplayException("KahfiModTzy Protection :: Only admin utama ID 1 can {$action} servers");
+        }
+    }
+PHP;
+
+$deleteMethod = <<<'PHP'
+    public function delete(Request $request, Server $server): RedirectResponse
+    {
+        $this->checkAdmin("delete");
+
+        // Force delete otomatis untuk admin utama ID 1.
+        // Ini bikin delete tetap jalan walau Wings/node sedang error/offline.
+        $this->deletionService->withForce(true)->handle($server);
+
+        $this->alert->success("Server deleted successfully.")->flash();
+
+        return redirect()->route("admin.servers");
+    }
+PHP;
+
+// Pastikan import Auth dan DisplayException ada.
+if (strpos($s, 'use Illuminate\Support\Facades\Auth;') === false) {
+    $s = preg_replace('/namespace\s+Pterodactyl\\\\Http\\\\Controllers\\\\Admin;\s*/', "namespace Pterodactyl\\Http\\Controllers\\Admin;\n\nuse Illuminate\\Support\\Facades\\Auth;\n", $s, 1);
+}
+if (strpos($s, 'use Pterodactyl\Exceptions\DisplayException;') === false) {
+    $s = preg_replace('/namespace\s+Pterodactyl\\\\Http\\\\Controllers\\\\Admin;\s*/', "namespace Pterodactyl\\Http\\Controllers\\Admin;\n\nuse Pterodactyl\\Exceptions\\DisplayException;\n", $s, 1);
+}
+
+// Patch checkAdmin kalau ada.
+$block = findPrivateMethodBlock($s, 'checkAdmin');
+if ($block) {
+    [$a, $b] = $block;
+    $s = substr($s, 0, $a) . $checkAdmin . substr($s, $b);
+} else {
+    // Sisipkan setelah constructor pertama.
+    $pos = strpos($s, "\n    public function index");
+    if ($pos === false) {
+        fwrite(STDERR, "WARNING: Tidak ketemu posisi checkAdmin. Lewati patch checkAdmin.\n");
+    } else {
+        $s = substr($s, 0, $pos) . "\n\n" . $checkAdmin . "\n" . substr($s, $pos);
+    }
+}
+
+// Patch delete method.
+$block = findMethodBlock($s, 'delete');
+if ($block) {
+    [$a, $b] = $block;
+    $s = substr($s, 0, $a) . $deleteMethod . substr($s, $b);
+} else {
+    fwrite(STDERR, "ERROR: Method delete() tidak ketemu di ServersController.php\n");
+    exit(1);
+}
+
+file_put_contents($file, $s);
+echo "OK: ServersController delete dipatch ID 1 + force delete.\n";
+PHP_PATCH
+
+# 3) FileController: jangan blokir backup/download SC user.
+#    Permission file manager biarkan request bawaan Pterodactyl yang handle.
+php <<'PHP_PATCH'
+<?php
+
+$file = '/var/www/pterodactyl/app/Http/Controllers/Api/Client/Servers/FileController.php';
+if (!is_file($file)) {
+    echo "WARNING: FileController.php tidak ketemu, skip.\n";
+    exit(0);
+}
+
+$s = file_get_contents($file);
+if ($s === false) {
+    echo "WARNING: Tidak bisa baca FileController.php, skip.\n";
+    exit(0);
+}
+
+if (!preg_match('/private\s+function\s+checkServerAccess\s*\([^)]*\)\s*(?::\s*[^{]+)?\s*\{/m', $s, $m, PREG_OFFSET_CAPTURE)) {
+    echo "INFO: checkServerAccess tidak ketemu, mungkin sudah bawaan panel.\n";
+    exit(0);
+}
+
+$start = $m[0][1];
+$brace = $start + strlen($m[0][0]) - 1;
+$depth = 0;
+$end = null;
+$len = strlen($s);
+
+for ($i = $brace; $i < $len; $i++) {
+    $ch = $s[$i];
+    if ($ch === '{') $depth++;
+    if ($ch === '}') {
+        $depth--;
+        if ($depth === 0) {
+            $end = $i + 1;
+            break;
+        }
+    }
+}
+
+if ($end === null) {
+    echo "WARNING: Gagal patch checkServerAccess.\n";
+    exit(0);
+}
+
+$new = <<<'PHP'
+    private function checkServerAccess($request, Server $server)
+    {
+        // Fix backup/download SC:
+        // Jangan blokir File Manager dengan protect custom.
+        // Permission bawaan Pterodactyl tetap jalan dari request class.
+        return;
+    }
+PHP;
+
+$s = substr($s, 0, $start) . $new . substr($s, $end);
+file_put_contents($file, $s);
+
+echo "OK: FileController checkServerAccess dimatikan agar backup/download normal.\n";
+PHP_PATCH
+
+chown -R www-data:www-data "$PANEL_PATH"
+
 php artisan optimize:clear >/dev/null 2>&1 || true
 php artisan view:clear >/dev/null 2>&1 || true
 php artisan route:clear >/dev/null 2>&1 || true
 php artisan config:clear >/dev/null 2>&1 || true
-php artisan cache:clear >/dev/null 2>&1 || true
 php artisan queue:restart >/dev/null 2>&1 || true
 
-echo "DONE. Coba delete server lagi dari akun admin utama. Kalau Wings/Node error, centang Force Delete."
-echo "Jangan jalankan bash protect lama lagi, nanti fix ini ketimpa."
+if systemctl list-unit-files | grep -q '^wings.service'; then
+  systemctl restart wings || true
+fi
+
+echo ""
+echo "DONE."
+echo "Sekarang coba delete server pakai admin utama ID 1."
+echo "Admin ke-2/3 tidak bisa delete server."
+echo "Backup/download SC user tidak diblokir protect custom."
